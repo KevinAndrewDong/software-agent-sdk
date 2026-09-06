@@ -31,6 +31,7 @@ from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
+    ConversationPublicState,
     ConversationState,
 )
 from openhands.sdk.llm.utils.metrics import MetricsSnapshot
@@ -375,12 +376,9 @@ def test_conversation_info_from_sources_maps_state_fields():
         sub_conversation_ids=[],
     )
 
-    exposed_state_fields = set(ConversationState.model_fields) - {
-        "activated_path_rules",
-        "head_is_empty",
-    }
-    assert info.model_dump(mode="json", include=exposed_state_fields) == (
-        state.model_dump(mode="json", include=exposed_state_fields)
+    public_state_fields = set(ConversationPublicState.model_fields)
+    assert info.model_dump(mode="json", include=public_state_fields) == (
+        state.model_dump(mode="json", include=public_state_fields)
     )
 
 
@@ -413,26 +411,9 @@ def test_conversation_info_from_sources_maps_stored_metadata():
         sub_conversation_ids=[],
     )
 
-    assert (
-        info.title,
-        info.metrics,
-        info.created_at,
-        info.updated_at,
-        info.parent_conversation_id,
-        info.forked_from_conversation_id,
-        info.forked_from_event_id,
-        info.client_tools,
-        info.launched_agent_profile,
-    ) == (
-        stored.title,
-        stored.metrics,
-        stored.created_at,
-        stored.updated_at,
-        stored.parent_conversation_id,
-        stored.forked_from_conversation_id,
-        stored.forked_from_event_id,
-        stored.client_tools,
-        stored.launched_agent_profile,
+    stored_metadata_fields = set(ConversationInfo.STORED_METADATA_FIELDS)
+    assert info.model_dump(include=stored_metadata_fields) == stored.model_dump(
+        include=stored_metadata_fields
     )
 
 
@@ -457,36 +438,34 @@ def test_conversation_info_from_sources_maps_runtime_fields():
     assert info.sub_conversation_ids == child_ids
 
 
-def test_conversation_info_source_fields_are_exposed_or_excluded():
-    exposed_state_fields = set(
-        "id agent workspace persistence_dir max_iterations stuck_detection "
-        "execution_status confirmation_policy security_analyzer "
-        "activated_knowledge_skills invoked_skills blocked_actions blocked_messages "
-        "last_user_message_id leaf_event_id stats secret_registry tags agent_state "
-        "hook_config".split()
-    )
-    excluded_state_fields = {"activated_path_rules", "head_is_empty"}
-    exposed_stored_fields = set(
-        "title metrics created_at updated_at forked_from_conversation_id "
-        "forked_from_event_id parent_conversation_id client_tools "
-        "launched_agent_profile".split()
-    )
-    excluded_stored_fields = set(
-        "workspace worktree conversation_id confirmation_policy security_analyzer "
-        "initial_message max_iterations stuck_detection secrets secrets_encrypted "
-        "tool_module_qualnames agent_launch_additions agent_definitions plugins "
-        "hook_config tags user_id observability_metadata observability_tags "
-        "observability_span_name autotitle title_llm_profile "
-        "required_runtime_credential_bindings id".split()
-    )
-    runtime_fields = set(
-        "current_model_id available_models supports_runtime_model_switch "
-        "sub_conversation_ids".split()
-    )
-    info_fields = set(ConversationInfo.model_fields)
-    state_fields = set(ConversationState.model_fields)
-    stored_fields = set(StoredConversation.model_fields)
+def test_conversation_info_reuses_public_state_schema():
+    internal_state_fields = {"activated_path_rules", "head_is_empty"}
 
-    assert state_fields == exposed_state_fields | excluded_state_fields
-    assert stored_fields == exposed_stored_fields | excluded_stored_fields
-    assert info_fields == exposed_state_fields | exposed_stored_fields | runtime_fields
+    assert issubclass(ConversationState, ConversationPublicState)
+    assert issubclass(ConversationInfo, ConversationPublicState)
+    assert set(ConversationPublicState.model_fields) <= set(
+        ConversationInfo.model_fields
+    )
+    assert (
+        set(ConversationState.model_fields) - set(ConversationPublicState.model_fields)
+        == internal_state_fields
+    )
+    assert internal_state_fields.isdisjoint(ConversationInfo.model_fields)
+
+
+def test_stored_metadata_projection_has_one_field_definition():
+    runtime_fields = {
+        "current_model_id",
+        "available_models",
+        "supports_runtime_model_switch",
+        "sub_conversation_ids",
+    }
+
+    assert ConversationInfo.STORED_METADATA_FIELDS <= set(
+        StoredConversation.model_fields
+    )
+    assert set(ConversationInfo.model_fields) == (
+        set(ConversationPublicState.model_fields)
+        | ConversationInfo.STORED_METADATA_FIELDS
+        | runtime_fields
+    )

@@ -601,23 +601,12 @@ def _stored_metadata_signature(stored: StoredConversation) -> int:
 
     ``cached_info`` is keyed by ``base_state.json``, but also embeds
     ``StoredConversation`` metadata that can change independently via
-    ``meta.json`` (notably auto-title). Fingerprint exactly the fields
-    ``_compose_conversation_info`` lifts from ``stored`` so a metadata-only
-    update invalidates the cache. Keep the set in sync with that function.
+    ``meta.json`` (notably auto-title). Fingerprint exactly the public metadata
+    fields so a metadata-only update invalidates the cache.
     """
     metadata = stored.model_dump(
         mode="json",
-        include={
-            "title",
-            "metrics",
-            "created_at",
-            "updated_at",
-            "forked_from_conversation_id",
-            "forked_from_event_id",
-            "parent_conversation_id",
-            "client_tools",
-            "launched_agent_profile",
-        },
+        include=set(ConversationInfo.STORED_METADATA_FIELDS),
     )
     return hash(json.dumps(metadata, sort_keys=True, default=str))
 
