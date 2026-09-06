@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC
 from datetime import datetime
 from enum import Enum, StrEnum
-from typing import Any
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -18,7 +18,10 @@ from openhands.sdk.conversation.request import (  # re-export for backward compa
     StartConversationRequest as StartConversationRequest,
 )
 from openhands.sdk.conversation.secret_registry import SecretRegistry
-from openhands.sdk.conversation.state import ConversationExecutionStatus
+from openhands.sdk.conversation.state import (
+    ConversationExecutionStatus,
+    ConversationState,
+)
 from openhands.sdk.conversation.types import ConversationTags
 from openhands.sdk.event.base import Event
 from openhands.sdk.hooks import HookConfig
@@ -335,6 +338,70 @@ class ConversationInfo(_ConversationInfoBase):
             "persisted events, avoiding 'Unknown kind' deserialization errors."
         ),
     )
+
+    @classmethod
+    def from_sources(
+        cls,
+        state: ConversationState,
+        stored: StoredConversation,
+        *,
+        current_model_id: str | None,
+        available_models: list[ACPModelInfo],
+        supports_runtime_model_switch: bool,
+        sub_conversation_ids: list[UUID],
+    ) -> Self:
+        """Build public conversation info from its explicit source models."""
+        # Preserve JSON-mode redaction for secret-bearing nested state.
+        serialized = state.model_dump(
+            mode="json",
+            include={
+                "agent",
+                "agent_state",
+                "secret_registry",
+                "security_analyzer",
+            },
+        )
+        return cls(
+            id=state.id,
+            agent=AgentBase.model_validate(serialized["agent"]),
+            workspace=state.workspace,
+            persistence_dir=state.persistence_dir,
+            max_iterations=state.max_iterations,
+            stuck_detection=state.stuck_detection,
+            execution_status=state.execution_status,
+            confirmation_policy=state.confirmation_policy,
+            security_analyzer=(
+                SecurityAnalyzerBase.model_validate(serialized["security_analyzer"])
+                if serialized["security_analyzer"] is not None
+                else None
+            ),
+            activated_knowledge_skills=state.activated_knowledge_skills,
+            invoked_skills=state.invoked_skills,
+            blocked_actions=state.blocked_actions,
+            blocked_messages=state.blocked_messages,
+            last_user_message_id=state.last_user_message_id,
+            leaf_event_id=state.leaf_event_id,
+            stats=state.stats,
+            secret_registry=SecretRegistry.model_validate(
+                serialized["secret_registry"]
+            ),
+            agent_state=serialized["agent_state"],
+            hook_config=state.hook_config,
+            tags=state.tags,
+            title=stored.title,
+            metrics=stored.metrics,
+            created_at=stored.created_at,
+            updated_at=stored.updated_at,
+            forked_from_conversation_id=stored.forked_from_conversation_id,
+            forked_from_event_id=stored.forked_from_event_id,
+            parent_conversation_id=stored.parent_conversation_id,
+            client_tools=stored.client_tools,
+            launched_agent_profile=stored.launched_agent_profile,
+            current_model_id=current_model_id,
+            available_models=available_models,
+            supports_runtime_model_switch=supports_runtime_model_switch,
+            sub_conversation_ids=sub_conversation_ids,
+        )
 
 
 class ConversationPage(BaseModel):
