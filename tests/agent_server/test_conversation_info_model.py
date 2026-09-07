@@ -438,6 +438,62 @@ def test_conversation_info_from_sources_maps_runtime_fields():
     assert info.sub_conversation_ids == child_ids
 
 
+def test_conversation_info_json_wire_contract():
+    agent = Agent(
+        llm=LLM(
+            model="gpt-4o",
+            api_key=SecretStr("test-key"),
+            usage_id="test-llm",
+        ),
+        tools=[Tool(name="TerminalTool")],
+    )
+    state = _make_state(agent)
+    info = _compose_conversation_info(_make_stored(state), state)
+
+    payload = info.model_dump(mode="json")
+
+    assert set(payload) == {
+        "id",
+        "agent",
+        "workspace",
+        "persistence_dir",
+        "max_iterations",
+        "stuck_detection",
+        "execution_status",
+        "confirmation_policy",
+        "security_analyzer",
+        "activated_knowledge_skills",
+        "invoked_skills",
+        "blocked_actions",
+        "blocked_messages",
+        "last_user_message_id",
+        "leaf_event_id",
+        "stats",
+        "secret_registry",
+        "tags",
+        "agent_state",
+        "hook_config",
+        "title",
+        "metrics",
+        "created_at",
+        "updated_at",
+        "forked_from_conversation_id",
+        "forked_from_event_id",
+        "parent_conversation_id",
+        "sub_conversation_ids",
+        "current_model_id",
+        "available_models",
+        "supports_runtime_model_switch",
+        "launched_agent_profile",
+        "client_tools",
+    }
+    assert "activated_path_rules" not in payload
+    assert "head_is_empty" not in payload
+    assert payload["id"] == str(state.id)
+    assert payload["agent"]["kind"] == "Agent"
+    assert payload["agent"]["llm"]["api_key"] is None
+
+
 def test_conversation_info_reuses_public_state_schema():
     internal_state_fields = {"activated_path_rules", "head_is_empty"}
 
