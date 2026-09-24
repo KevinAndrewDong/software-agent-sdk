@@ -961,6 +961,7 @@ class RemoteConversation(BaseConversation):
             workspace.client, "GET", f"{CONVERSATIONS_PATH}/{conversation_id}"
         )
         conversation = cls._from_info(workspace, response.json(), callbacks, visualizer)
+        workspace.register_conversation(str(conversation.id))
         conversation._start_observability_span(str(conversation.id))
         return conversation
 

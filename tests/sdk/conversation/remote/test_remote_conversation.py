@@ -205,6 +205,7 @@ class TestRemoteConversation:
             assert isinstance(expected, ACPAgent)
             assert conversation.agent.acp_command == expected.acp_command
         assert conversation.id == cid
+        assert self.workspace.conversation_id == str(cid)
         conversation.close()
         assert all(call.args[0] == "GET" for call in client.request.call_args_list)
         client.close.assert_not_called()  # The caller still owns the workspace.
@@ -303,6 +304,23 @@ class TestRemoteConversation:
         assert [call.args[0] for call in client.request.call_args_list] == [
             expected_method
         ]
+        assert self.workspace.conversation_id is None
+
+    @pytest.mark.parametrize("status", [403, 404])
+    def test_failed_attach_preserves_registered_conversation(self, status):
+        cid = uuid.uuid4()
+        client = self.setup_mock_client(str(cid))
+        self.workspace.register_conversation("existing-conversation")
+        client.request.side_effect = None
+        client.request.return_value = httpx.Response(
+            status, request=httpx.Request("GET", f"{self.host}/api/conversations/{cid}")
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            RemoteConversation.attach(self.workspace, cid, visualizer=None)
+
+        assert self.workspace.conversation_id == "existing-conversation"
+        assert [call.args[0] for call in client.request.call_args_list] == ["GET"]
 
     @patch(
         "openhands.sdk.conversation.impl.remote_conversation.WebSocketCallbackClient"
