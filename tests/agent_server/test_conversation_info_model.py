@@ -412,6 +412,7 @@ def test_conversation_info_from_sources_maps_stored_metadata():
             "forked_from_conversation_id": fork_id,
             "forked_from_event_id": "fork-event",
             "client_tools": [client_tool],
+            "tool_module_qualnames": {"lookup": "example.lookup"},
             "launched_agent_profile": profile,
         }
     )
@@ -500,6 +501,7 @@ def test_conversation_info_json_wire_contract():
         "supports_runtime_model_switch",
         "launched_agent_profile",
         "client_tools",
+        "tool_module_qualnames",
         "runtime_info",
     }
     assert "activated_path_rules" not in payload
@@ -513,7 +515,13 @@ def test_conversation_info_classifies_every_conversation_state_field():
     assert set(ConversationState.model_fields) == (
         ConversationInfo.STATE_FIELDS | ConversationInfo.INTERNAL_STATE_FIELDS
     )
+
+
+def test_public_state_fields_exist_on_conversation_info():
     assert ConversationInfo.STATE_FIELDS <= set(ConversationInfo.model_fields)
+
+
+def test_internal_state_fields_are_not_exposed():
     assert ConversationInfo.INTERNAL_STATE_FIELDS.isdisjoint(
         ConversationInfo.model_fields
     )
