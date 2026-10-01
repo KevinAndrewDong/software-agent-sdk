@@ -32,6 +32,7 @@ MAX_PROMPT_CHARS = 20_000
 MAX_OUTPUT_CHARS = 20_000
 MAX_OUTPUT_TOKENS = 8_192
 PROMPT_ENHANCEMENT_TIMEOUT_SECONDS = 45
+_SAFE_OBSERVABILITY_INSTRUMENTS = frozenset({"opentelemetry"})
 
 
 class PromptEnhancementErrorCode(StrEnum):
@@ -87,6 +88,22 @@ class _EnhancementFailure(Exception):
         self.message = message
 
 
+def _prompt_payload_capture_enabled() -> bool:
+    if os.getenv("DEBUG_LLM", "false").lower() in {"1", "true", "yes"}:
+        return True
+    if not should_enable_observability():
+        return False
+
+    # Laminar's default instruments include LiteLLM and capture request/response
+    # bodies. Explicitly selecting only OTel context propagation avoids payload
+    # capture while retaining trace export; unknown instruments fail closed.
+    configured = os.getenv("LMNR_INSTRUMENTS")
+    if configured is None:
+        return True
+    instruments = {item.strip() for item in configured.split(",") if item.strip()}
+    return instruments != _SAFE_OBSERVABILITY_INSTRUMENTS
+
+
 def _error_response(
     status_code: int, code: PromptEnhancementErrorCode, message: str
 ) -> JSONResponse:
@@ -95,16 +112,11 @@ def _error_response(
 
 
 async def _load_profile(name: str, request: Request) -> LLM:
-    if should_enable_observability() or os.getenv("DEBUG_LLM", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if _prompt_payload_capture_enabled():
         raise _EnhancementFailure(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,
-            "Prompt enhancement is unavailable while LLM prompt logging "
-            "or tracing is enabled.",
+            "Prompt enhancement is unavailable while LLM payload capture is enabled.",
         )
 
     config = get_config(request)
@@ -265,7 +277,13 @@ async def enhance_prompt(
             PromptEnhancementErrorCode.ENHANCEMENT_TIMEOUT,
             "The model did not finish prompt enhancement before the server timeout.",
         )
-    except (LLMAuthenticationError, LLMBadRequestError):
+    except LLMAuthenticationError:
+        return _error_response(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            PromptEnhancementErrorCode.PROFILE_UNAVAILABLE,
+            "The selected profile's credentials were rejected by the provider.",
+        )
+    except LLMBadRequestError:
         return _error_response(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,

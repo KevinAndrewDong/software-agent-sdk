@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Literal
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -15,7 +16,15 @@ from openhands.agent_server import (
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
 from openhands.sdk.llm import LLM, Message, TextContent
+from openhands.sdk.llm.exceptions import (
+    LLMAuthenticationError,
+    LLMBadRequestError,
+    LLMError,
+    LLMNoResponseError,
+    LLMTimeoutError,
+)
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
+from openhands.sdk.llm.provider_connection_store import ProviderConnectionNotFound
 
 
 @pytest.fixture
@@ -23,6 +32,9 @@ def client_and_store(tmp_path, monkeypatch):
     store = LLMProfileStore(base_dir=tmp_path / "profiles")
     monkeypatch.setattr(router_module, "get_llm_profile_store", lambda: store)
     monkeypatch.setattr(profiles_router_module, "get_llm_profile_store", lambda: store)
+    monkeypatch.setattr(router_module, "should_enable_observability", lambda: False)
+    monkeypatch.delenv("LMNR_INSTRUMENTS", raising=False)
+    monkeypatch.delenv("DEBUG_LLM", raising=False)
     app = create_app(Config(static_files_path=None, session_api_keys=[]))
     with TestClient(app) as client:
         yield client, store
@@ -144,6 +156,59 @@ def test_responses_api_disables_provider_side_storage(client_and_store, monkeypa
     assert kwargs["store"] is False
 
 
+@pytest.mark.parametrize(
+    ("draft", "edited"),
+    [
+        pytest.param(
+            "Improve this request. Keep tenantId=acme, /src/views/Map.vue, "
+            "`pnpm test`, https://example.com, 30, and this code:\n"
+            "```ts\nconst count = 30;\n```",
+            "Clarify this request while keeping tenantId=acme, "
+            "/src/views/Map.vue, `pnpm test`, https://example.com, 30, and this "
+            "code:\n```ts\nconst count = 30;\n```",
+            id="english",
+        ),
+        pytest.param(
+            "次の依頼を明確にしてください。tenantId=acme、/src/views/Map.vue、"
+            "`pnpm test`、https://example.com、数値30と次のコードを保持してください。\n"
+            "```ts\nconst count = 30;\n```",
+            "次の依頼をより明確にしてください。tenantId=acme、/src/views/Map.vue、"
+            "`pnpm test`、https://example.com、数値30と次のコードを保持してください。\n"
+            "```ts\nconst count = 30;\n```",
+            id="japanese",
+        ),
+    ],
+)
+def test_enhance_preserves_multilingual_constraints(
+    client_and_store, monkeypatch, draft, edited
+):
+    client, store = client_and_store
+    save_profile(store)
+    captured = []
+    mock_completion(monkeypatch, edited, captured)
+
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": draft},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"enhanced_text": edited}
+    _llm, messages, tools, _kwargs = captured[0]
+    assert messages[1].content[0].text == draft
+    assert "same language" in messages[0].content[0].text
+    assert tools == []
+    for preserved in (
+        "tenantId=acme",
+        "/src/views/Map.vue",
+        "pnpm test",
+        "https://example.com",
+        "30",
+        "const count = 30;",
+    ):
+        assert preserved in response.json()["enhanced_text"]
+
+
 def test_enhance_rejects_empty_and_oversized_input(client_and_store):
     client, _store = client_and_store
 
@@ -185,6 +250,110 @@ def test_prompt_and_provider_error_text_are_not_returned_or_logged(
     assert error_code(response) == "provider_error"
     assert sentinel not in response.text
     assert sentinel not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("failure", "status_code", "code"),
+    [
+        pytest.param(
+            LLMAuthenticationError("credential sentinel 5fd1"),
+            422,
+            "profile_unavailable",
+            id="provider-authentication",
+        ),
+        pytest.param(
+            LLMBadRequestError("configuration sentinel 5fd1"),
+            422,
+            "unsupported_configuration",
+            id="unsupported-configuration",
+        ),
+        pytest.param(
+            LLMNoResponseError("empty output sentinel 5fd1"),
+            502,
+            "invalid_model_output",
+            id="invalid-output",
+        ),
+        pytest.param(
+            LLMTimeoutError("timeout sentinel 5fd1"),
+            504,
+            "enhancement_timeout",
+            id="provider-timeout",
+        ),
+        pytest.param(
+            LLMError("upstream sentinel 5fd1"),
+            502,
+            "provider_error",
+            id="upstream-error",
+        ),
+    ],
+)
+def test_provider_errors_have_stable_codes_without_exposing_details(
+    client_and_store, monkeypatch, caplog, failure, status_code, code
+):
+    client, store = client_and_store
+    save_profile(store)
+    seen = []
+
+    async def fail(llm, **_kwargs):
+        seen.append((llm.api_mode, type(failure)))
+        raise failure
+
+    monkeypatch.setattr(LLM, "acompletion", fail)
+    monkeypatch.setattr(LLM, "aresponses", fail)
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Private draft."},
+    )
+
+    assert seen, "The mocked provider method was not called."
+    assert response.status_code == status_code, response.text
+    assert error_code(response) == code
+    assert "5fd1" not in response.text
+    assert "5fd1" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("failure", "status_code", "code"),
+    [
+        pytest.param(
+            TimeoutError("profile lock sentinel 8a41"),
+            503,
+            "profile_store_timeout",
+            id="store-timeout",
+        ),
+        pytest.param(
+            ProviderConnectionNotFound("provider connection sentinel 8a41"),
+            422,
+            "profile_unavailable",
+            id="missing-provider-connection",
+        ),
+        pytest.param(
+            ValueError("decrypt sentinel 8a41"),
+            422,
+            "profile_unavailable",
+            id="profile-resolution-error",
+        ),
+    ],
+)
+def test_profile_store_errors_have_stable_codes_without_exposing_details(
+    client_and_store, monkeypatch, caplog, failure, status_code, code
+):
+    client, _store = client_and_store
+
+    class FailingProfileStore:
+        def load(self, _name, *, cipher=None):
+            raise failure
+
+    monkeypatch.setattr(router_module, "get_llm_profile_store", FailingProfileStore)
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Private draft."},
+    )
+
+    assert response.status_code == status_code
+    assert error_code(response) == code
+    assert "8a41" not in response.text
+    assert "8a41" not in caplog.text
 
 
 def test_enhance_enforces_output_validation_limits_and_timeout(
@@ -268,11 +437,13 @@ def test_openapi_describes_prompt_enhancement_and_input_limit(client_and_store):
     assert text_schema["maxLength"] == router_module.MAX_PROMPT_CHARS
 
 
-def test_prompt_enhancement_is_unavailable_when_analytics_can_capture_payloads(
+def test_prompt_enhancement_is_unavailable_when_payload_tracing_is_enabled(
     client_and_store, monkeypatch
 ):
     client, store = client_and_store
     save_profile(store)
+    monkeypatch.delenv("LMNR_INSTRUMENTS", raising=False)
+    monkeypatch.delenv("DEBUG_LLM", raising=False)
     called = False
 
     async def complete(_llm, messages, **_kwargs):
@@ -313,6 +484,76 @@ def test_prompt_enhancement_is_unavailable_when_analytics_can_capture_payloads(
     assert debug_response.json()["code"] == "unsupported_configuration"
     assert debug_sentinel not in debug_response.text
     assert called is False
+
+
+def test_prompt_enhancement_allows_context_only_otel_tracing(
+    client_and_store, monkeypatch
+):
+    client, store = client_and_store
+    save_profile(store)
+    monkeypatch.setattr(router_module, "should_enable_observability", lambda: True)
+    monkeypatch.setenv("LMNR_INSTRUMENTS", "opentelemetry")
+    monkeypatch.delenv("DEBUG_LLM", raising=False)
+    mock_completion(monkeypatch, "Edited without prompt tracing.")
+
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Private draft."},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"enhanced_text": "Edited without prompt tracing."}
+
+
+@pytest.mark.parametrize("instruments", ["", "opentelemetry,litellm"])
+def test_prompt_enhancement_fails_closed_for_unsafe_instrumentation(
+    client_and_store, monkeypatch, instruments
+):
+    client, store = client_and_store
+    save_profile(store)
+    monkeypatch.setattr(router_module, "should_enable_observability", lambda: True)
+    monkeypatch.setenv("LMNR_INSTRUMENTS", instruments)
+    captured = []
+    mock_completion(monkeypatch, "Must not be called.", captured)
+
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Private draft."},
+    )
+
+    assert response.status_code == 422
+    assert error_code(response) == "unsupported_configuration"
+    assert captured == []
+
+
+def test_enhance_propagates_cancellation(monkeypatch):
+    monkeypatch.setattr(router_module, "should_enable_observability", lambda: False)
+    monkeypatch.delenv("DEBUG_LLM", raising=False)
+
+    async def load_profile(_name, _request):
+        return LLM(model="openai/gpt-4.1-mini", api_mode="chat")
+
+    called = False
+
+    async def cancel(_llm, **_kwargs):
+        nonlocal called
+        called = True
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(router_module, "_load_profile", load_profile)
+    monkeypatch.setattr(LLM, "acompletion", cancel)
+    monkeypatch.setattr(LLM, "aresponses", cancel)
+    request = Request({"type": "http"})
+    body = router_module.PromptEnhancementRequest(
+        profile_name="draft-profile", text="Private draft."
+    )
+
+    async def invoke():
+        await router_module.enhance_prompt(request, body)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(invoke())
+    assert called
 
 
 def test_prompt_enhancement_requires_the_agent_server_session_key():

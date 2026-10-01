@@ -328,6 +328,9 @@ if (availability.available) {
 
 Aborting rejects the client request promptly. A disconnected client may not
 cancel the provider request; the Agent Server enforces its own timeout.
+When tracing is enabled, prompt enhancement requires LLM payload capture to be
+disabled. With Laminar, set `LMNR_INSTRUMENTS=opentelemetry` to retain trace
+export without the default LiteLLM request/response instrumentation.
 
 ### Conversation
 
