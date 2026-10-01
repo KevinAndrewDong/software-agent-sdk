@@ -21,6 +21,32 @@ import type {
   UpdateSettingsApiSettingsPatchResponse,
 } from '../generated/agent-server-schema';
 
+/**
+ * Mirror this unreleased endpoint's OpenAPI until the pinned Agent Server
+ * release includes it; the generated contract stays tied to the published image.
+ */
+export type AgentServerPromptEnhancementRequest = {
+  profile_name: string;
+  text: string;
+};
+export type AgentServerPromptEnhancementResponse = { enhanced_text: string };
+export type AgentServerPromptEnhancementAvailabilityResponse = {
+  available: boolean;
+  code?: AgentServerPromptEnhancementErrorCode | null;
+  message?: string | null;
+};
+export type AgentServerPromptEnhancementErrorCode =
+  | 'empty_input'
+  | 'input_too_large'
+  | 'output_too_large'
+  | 'invalid_model_output'
+  | 'profile_not_found'
+  | 'profile_unavailable'
+  | 'unsupported_configuration'
+  | 'profile_store_timeout'
+  | 'enhancement_timeout'
+  | 'provider_error';
+
 export type AgentServerSettingsSchema = GetAgentSettingsSchemaApiSettingsAgentSchemaGetResponse;
 export type AgentServerConversationSettingsSchema =
   GetConversationSettingsSchemaApiSettingsConversationSchemaGetResponse;
