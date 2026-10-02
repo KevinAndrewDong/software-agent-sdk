@@ -93,7 +93,7 @@ async function main() {
           '//   AGENT_SERVER_OPENAPI_PATH=/path/to/openapi.json',
           `//   AGENT_SERVER_OPENAPI_PATH_PREFIX=${pathPrefix}`,
           '//   AGENT_SERVER_GENERATED_OUTPUT=src/generated/prompt-enhancement-schema.ts',
-          '//   npm run generate:agent-server-api',
+          `//   npm run ${process.env.AGENT_SERVER_GENERATE_COMMAND ?? 'generate:agent-server-api'}`,
           '',
         ].join('\n')
       : [

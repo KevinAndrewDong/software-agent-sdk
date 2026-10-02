@@ -489,9 +489,16 @@ def test_prompt_enhancement_is_unavailable_when_payload_tracing_is_enabled(
 def test_prompt_enhancement_allows_context_only_otel_tracing(
     client_and_store, monkeypatch
 ):
+    from openhands.sdk.observability.laminar import should_enable_observability
+
     client, store = client_and_store
     save_profile(store)
-    monkeypatch.setattr(router_module, "should_enable_observability", lambda: True)
+    monkeypatch.setattr(
+        router_module, "should_enable_observability", should_enable_observability
+    )
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+    )
     monkeypatch.setenv("LMNR_INSTRUMENTS", "opentelemetry")
     monkeypatch.delenv("DEBUG_LLM", raising=False)
     mock_completion(monkeypatch, "Edited without prompt tracing.")
@@ -505,13 +512,72 @@ def test_prompt_enhancement_allows_context_only_otel_tracing(
     assert response.json() == {"enhanced_text": "Edited without prompt tracing."}
 
 
+def test_laminar_instrument_configuration_matches_payload_capture_guard(monkeypatch):
+    from lmnr import Instruments, Laminar
+    from lmnr.opentelemetry_lib.tracing._instrument_initializers import (
+        LitellmInstrumentorInitializer,
+        OpenTelemetryInstrumentorInitializer,
+    )
+    from lmnr.opentelemetry_lib.tracing.instruments import INSTRUMENTATION_INITIALIZERS
+
+    from openhands.sdk.observability.laminar import maybe_init_laminar
+
+    assert Instruments("opentelemetry") is Instruments.OPENTELEMETRY
+    assert Instruments("litellm") is Instruments.LITELLM
+    assert router_module._SAFE_OBSERVABILITY_INSTRUMENTS == {
+        Instruments.OPENTELEMETRY.value
+    }
+    assert isinstance(
+        INSTRUMENTATION_INITIALIZERS[Instruments.OPENTELEMETRY],
+        OpenTelemetryInstrumentorInitializer,
+    )
+    assert isinstance(
+        INSTRUMENTATION_INITIALIZERS[Instruments.LITELLM],
+        LitellmInstrumentorInitializer,
+    )
+
+    initialized = {}
+    monkeypatch.setattr(Laminar, "is_initialized", classmethod(lambda _cls: False))
+    monkeypatch.setattr(
+        Laminar,
+        "initialize",
+        classmethod(lambda _cls, **kwargs: initialized.update(kwargs)),
+    )
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+    )
+    monkeypatch.delenv("DEBUG_LLM", raising=False)
+
+    for configuration, parsed, captures_payload in (
+        ("opentelemetry", {Instruments.OPENTELEMETRY}, False),
+        ("litellm", {Instruments.LITELLM}, True),
+        (
+            "opentelemetry,litellm",
+            {Instruments.OPENTELEMETRY, Instruments.LITELLM},
+            True,
+        ),
+    ):
+        monkeypatch.setenv("LMNR_INSTRUMENTS", configuration)
+        initialized.clear()
+        maybe_init_laminar()
+        assert initialized["instruments"] == parsed
+        assert router_module._prompt_payload_capture_enabled() is captures_payload
+
+
 @pytest.mark.parametrize("instruments", ["", "opentelemetry,litellm"])
 def test_prompt_enhancement_fails_closed_for_unsafe_instrumentation(
     client_and_store, monkeypatch, instruments
 ):
+    from openhands.sdk.observability.laminar import should_enable_observability
+
     client, store = client_and_store
     save_profile(store)
-    monkeypatch.setattr(router_module, "should_enable_observability", lambda: True)
+    monkeypatch.setattr(
+        router_module, "should_enable_observability", should_enable_observability
+    )
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+    )
     monkeypatch.setenv("LMNR_INSTRUMENTS", instruments)
     captured = []
     mock_completion(monkeypatch, "Must not be called.", captured)
