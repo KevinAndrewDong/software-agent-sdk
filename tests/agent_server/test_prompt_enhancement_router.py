@@ -1,12 +1,18 @@
 """Tests for the standalone prompt-enhancement API."""
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+from filelock import FileLock
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import SecretStr
 
 from openhands.agent_server import (
@@ -486,9 +492,7 @@ def test_prompt_enhancement_is_unavailable_when_payload_tracing_is_enabled(
     assert called is False
 
 
-def test_prompt_enhancement_allows_context_only_otel_tracing(
-    client_and_store, monkeypatch
-):
+def test_prompt_enhancement_blocks_exception_tracing(client_and_store, monkeypatch):
     from openhands.sdk.observability.laminar import should_enable_observability
 
     client, store = client_and_store
@@ -501,67 +505,61 @@ def test_prompt_enhancement_allows_context_only_otel_tracing(
     )
     monkeypatch.setenv("LMNR_INSTRUMENTS", "opentelemetry")
     monkeypatch.delenv("DEBUG_LLM", raising=False)
-    mock_completion(monkeypatch, "Edited without prompt tracing.")
+    sentinel = "Private draft sentinel f840"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("prompt-enhancement-test")
+    monkeypatch.setattr(
+        "openhands.sdk.observability.laminar.llm_call_span",
+        tracer.start_as_current_span,
+    )
+
+    async def fail_transport(_llm, **_kwargs):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(LLM, "_atransport_call", fail_transport)
 
     response = client.post(
         "/api/prompt-enhancement/enhance",
-        json={"profile_name": "draft-profile", "text": "Private draft."},
+        json={"profile_name": "draft-profile", "text": sentinel},
     )
 
-    assert response.status_code == 200
-    assert response.json() == {"enhanced_text": "Edited without prompt tracing."}
+    events = [
+        dict(event.attributes or {})
+        for span in exporter.get_finished_spans()
+        for event in span.events
+    ]
+    assert sentinel not in str(events)
+    assert response.status_code == 422
+    assert error_code(response) == "unsupported_configuration"
+    assert sentinel not in response.text
 
 
-def test_laminar_instrument_configuration_matches_payload_capture_guard(monkeypatch):
-    from lmnr import Instruments, Laminar
-    from lmnr.opentelemetry_lib.tracing._instrument_initializers import (
-        LitellmInstrumentorInitializer,
-        OpenTelemetryInstrumentorInitializer,
-    )
-    from lmnr.opentelemetry_lib.tracing.instruments import INSTRUMENTATION_INITIALIZERS
+def test_profile_lock_wait_respects_endpoint_timeout(client_and_store, monkeypatch):
+    client, store = client_and_store
+    save_profile(store)
+    acquired = threading.Event()
 
-    from openhands.sdk.observability.laminar import maybe_init_laminar
+    def hold_lock():
+        with FileLock(store.base_dir / ".profiles.lock"):
+            acquired.set()
+            time.sleep(0.3)
 
-    assert Instruments("opentelemetry") is Instruments.OPENTELEMETRY
-    assert Instruments("litellm") is Instruments.LITELLM
-    assert router_module._SAFE_OBSERVABILITY_INSTRUMENTS == {
-        Instruments.OPENTELEMETRY.value
-    }
-    assert isinstance(
-        INSTRUMENTATION_INITIALIZERS[Instruments.OPENTELEMETRY],
-        OpenTelemetryInstrumentorInitializer,
-    )
-    assert isinstance(
-        INSTRUMENTATION_INITIALIZERS[Instruments.LITELLM],
-        LitellmInstrumentorInitializer,
-    )
-
-    initialized = {}
-    monkeypatch.setattr(Laminar, "is_initialized", classmethod(lambda _cls: False))
-    monkeypatch.setattr(
-        Laminar,
-        "initialize",
-        classmethod(lambda _cls, **kwargs: initialized.update(kwargs)),
-    )
-    monkeypatch.setenv(
-        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
-    )
-    monkeypatch.delenv("DEBUG_LLM", raising=False)
-
-    for configuration, parsed, captures_payload in (
-        ("opentelemetry", {Instruments.OPENTELEMETRY}, False),
-        ("litellm", {Instruments.LITELLM}, True),
-        (
-            "opentelemetry,litellm",
-            {Instruments.OPENTELEMETRY, Instruments.LITELLM},
-            True,
-        ),
-    ):
-        monkeypatch.setenv("LMNR_INSTRUMENTS", configuration)
-        initialized.clear()
-        maybe_init_laminar()
-        assert initialized["instruments"] == parsed
-        assert router_module._prompt_payload_capture_enabled() is captures_payload
+    worker = threading.Thread(target=hold_lock)
+    worker.start()
+    try:
+        assert acquired.wait(timeout=2)
+        monkeypatch.setattr(router_module, "PROMPT_ENHANCEMENT_TIMEOUT_SECONDS", 0.02)
+        mock_completion(monkeypatch, "Edited.")
+        response = client.post(
+            "/api/prompt-enhancement/enhance",
+            json={"profile_name": "draft-profile", "text": "Private draft."},
+        )
+        assert response.status_code == 504
+        assert error_code(response) == "enhancement_timeout"
+    finally:
+        worker.join()
 
 
 @pytest.mark.parametrize("instruments", ["", "opentelemetry,litellm"])

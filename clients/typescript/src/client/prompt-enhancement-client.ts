@@ -1,5 +1,6 @@
 import { HttpClient, HttpError } from './http-client';
 import { getCachedAgentServerInfo } from './agent-server-compatibility';
+import type { ServerInfo } from '../types/base';
 import type {
   AgentServerPromptEnhancementAvailabilityResponse,
   AgentServerPromptEnhancementErrorCode,
@@ -103,7 +104,9 @@ export class PromptEnhancementClient {
     request: AgentServerPromptEnhancementRequest,
     options: PromptEnhancementRequestOptions = {}
   ): Promise<AgentServerPromptEnhancementResponse> {
-    const serverInfo = await getCachedAgentServerInfo(this.client);
+    const serverInfo = options.signal
+      ? (await this.client.get<ServerInfo>('/server_info', { signal: options.signal })).data
+      : await getCachedAgentServerInfo(this.client);
     if (!serverInfo.capabilities?.includes(PROMPT_ENHANCEMENT_CAPABILITY)) {
       throw new PromptEnhancementUnavailableError(
         'This Agent Server does not support prompt enhancement.'

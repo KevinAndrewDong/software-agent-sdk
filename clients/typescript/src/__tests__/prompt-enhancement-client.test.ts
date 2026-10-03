@@ -129,6 +129,30 @@ describe('PromptEnhancementClient', () => {
     expect(signals[0].aborted).toBe(true);
   });
 
+  it('cancels the first capability probe before sending a draft', async () => {
+    let probeSignal: AbortSignal | undefined;
+    global.fetch = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      probeSignal = init.signal as AbortSignal;
+      return new Promise((_resolve, reject) => {
+        probeSignal?.addEventListener('abort', () =>
+          reject(new DOMException('Aborted', 'AbortError'))
+        );
+      });
+    }) as unknown as typeof fetch;
+    const client = new PromptEnhancementClient({ host: 'https://agent.example.test' });
+    const controller = new AbortController();
+    const pending = client.enhancePrompt(
+      { profile_name: 'default', text: 'Private draft.' },
+      { signal: controller.signal }
+    );
+    await vi.waitFor(() => expect(probeSignal).toBeDefined());
+    controller.abort();
+
+    expect(probeSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('throws a typed error when enhancement is called on an unsupported backend', async () => {
     global.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ version: '1.40.0', capabilities: [] }), {

@@ -32,7 +32,6 @@ MAX_PROMPT_CHARS = 20_000
 MAX_OUTPUT_CHARS = 20_000
 MAX_OUTPUT_TOKENS = 8_192
 PROMPT_ENHANCEMENT_TIMEOUT_SECONDS = 45
-_SAFE_OBSERVABILITY_INSTRUMENTS = frozenset({"opentelemetry"})
 
 
 class PromptEnhancementErrorCode(StrEnum):
@@ -91,17 +90,8 @@ class _EnhancementFailure(Exception):
 def _prompt_payload_capture_enabled() -> bool:
     if os.getenv("DEBUG_LLM", "false").lower() in {"1", "true", "yes"}:
         return True
-    if not should_enable_observability():
-        return False
-
-    # Laminar's default instruments include LiteLLM and capture request/response
-    # bodies. Explicitly selecting only OTel context propagation avoids payload
-    # capture while retaining trace export; unknown instruments fail closed.
-    configured = os.getenv("LMNR_INSTRUMENTS")
-    if configured is None:
-        return True
-    instruments = {item.strip() for item in configured.split(",") if item.strip()}
-    return instruments != _SAFE_OBSERVABILITY_INSTRUMENTS
+    # Exception spans can contain private text even without body instrumentation.
+    return should_enable_observability()
 
 
 def _error_response(
@@ -116,12 +106,14 @@ async def _load_profile(name: str, request: Request) -> LLM:
         raise _EnhancementFailure(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,
-            "Prompt enhancement is unavailable while LLM payload capture is enabled.",
+            "Prompt enhancement requires LLM tracing and logging to be disabled.",
         )
 
     config = get_config(request)
     try:
-        llm = get_llm_profile_store().load(name, cipher=config.cipher)
+        llm = await asyncio.to_thread(
+            get_llm_profile_store().load, name, cipher=config.cipher
+        )
     except FileNotFoundError:
         raise _EnhancementFailure(
             status.HTTP_404_NOT_FOUND,
