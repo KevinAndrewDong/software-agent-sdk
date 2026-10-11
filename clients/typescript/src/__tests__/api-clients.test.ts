@@ -11,6 +11,7 @@ import {
   Workspace,
 } from '../index';
 import {
+  ACPClient,
   AgentProfilesClient,
   AgentServerClient,
   AgentServerVersionError,
@@ -569,6 +570,41 @@ describe('Auxiliary API clients', () => {
         body: JSON.stringify({ llm: { model: 'gpt-4o', api_key: 'encrypted' } }),
       })
     );
+  });
+
+  it('ACPClient.discoverModels posts the agent and secrets and returns the discovery', async () => {
+    const discovery = {
+      agent_name: 'pi-acp',
+      agent_version: '0.0.33',
+      current_model_id: 'anthropic/claude-opus-4-8',
+      available_models: [{ model_id: 'anthropic/claude-opus-4-8', name: 'Opus 4.8' }],
+      supports_runtime_model_switch: true,
+      error: null,
+    };
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(discovery), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ) as typeof fetch;
+    const request = {
+      agent_settings: { agent_kind: 'acp' as const, acp_server: 'pi' },
+      secrets: {
+        ANTHROPIC_API_KEY: {
+          kind: 'LookupSecret' as const,
+          url: '/api/settings/secrets/ANTHROPIC_API_KEY',
+        },
+      },
+    };
+
+    const client = new ACPClient({ host: 'http://example.com/', apiKey: 'secret' });
+    const result = await client.discoverModels(request);
+
+    expect(result).toEqual(discovery);
+    const [url, init] = (global.fetch as Mock).mock.calls[0];
+    expect(url).toBe('http://example.com/api/acp/models');
+    expect(init).toMatchObject({ method: 'POST' });
+    expect(JSON.parse(init.body as string)).toEqual(request);
   });
 
   it('LLMMetadataClient.getOpenAISubscriptionModels returns models array', async () => {
@@ -1255,6 +1291,29 @@ describe('Auxiliary API clients', () => {
         body: JSON.stringify({ command: 'echo hi', cwd: '/tmp', timeout: 3 }),
       })
     );
+  });
+
+  it('BashClient.stopCommand POSTs to the stop endpoint and swallows 404', async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    ) as typeof fetch;
+
+    const client = new BashClient({ host: 'http://example.com' });
+    await client.stopCommand('cmd-1');
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'http://example.com/api/bash/bash_commands/cmd-1/stop',
+      expect.objectContaining({ method: 'POST' })
+    );
+
+    global.fetch = vi
+      .fn()
+      .mockResolvedValue(new Response('Not Found', { status: 404 })) as typeof fetch;
+
+    await expect(client.stopCommand('missing')).resolves.toBeUndefined();
   });
 
   it('ProfilesClient.listProfiles GETs the profiles endpoint', async () => {
