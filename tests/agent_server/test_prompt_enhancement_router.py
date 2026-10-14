@@ -136,7 +136,7 @@ def test_enhance_uses_server_profile_without_side_effects_or_prompt_logs(
     assert "same language" in messages[0].content[0].text
     assert messages[1].content[0].text == prompt
     assert tools == []
-    assert kwargs["max_tokens"] == router_module.MAX_OUTPUT_TOKENS
+    assert llm.effective_max_output_tokens == router_module.MAX_OUTPUT_TOKENS
     assert llm.log_completions is False
     assert llm.num_retries == 0
     assert llm.telemetry.log_enabled is False
@@ -166,10 +166,10 @@ def test_responses_api_disables_provider_side_storage(client_and_store, monkeypa
 
     assert response.status_code == 200
     assert response.json() == {"enhanced_text": "Improved draft."}
-    _llm, messages, tools, kwargs = captured[0]
+    llm, messages, tools, kwargs = captured[0]
     assert [message.role for message in messages] == ["system", "user"]
     assert tools == []
-    assert kwargs["max_tokens"] == router_module.MAX_OUTPUT_TOKENS
+    assert llm.effective_max_output_tokens == router_module.MAX_OUTPUT_TOKENS
     assert kwargs["store"] is False
 
 
@@ -227,6 +227,136 @@ def test_enhance_makes_one_provider_call(
     assert store.load("draft-profile").model_dump(mode="json") == profile_before
     assert sentinel not in response.text
     assert sentinel not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("model", "api_mode", "budget_key"),
+    [
+        ("azure/gpt-4.1", "chat", "max_tokens"),
+        ("openai/gpt-4.1-mini", "chat", "max_completion_tokens"),
+        ("openai/gpt-4.1-mini", "responses", "max_output_tokens"),
+    ],
+)
+@pytest.mark.parametrize("profile_budget", [1024, 8192, 32768, None])
+def test_enhance_bounds_provider_token_budget(
+    client_and_store, monkeypatch, model, api_mode, budget_key, profile_budget
+):
+    client, store = client_and_store
+    store.save(
+        "draft-profile",
+        LLM(
+            model=model,
+            api_mode=api_mode,
+            api_key=SecretStr("sk-profile-secret"),
+            max_output_tokens=profile_budget,
+        ),
+        include_secrets=True,
+    )
+    profile_before = store.load("draft-profile").model_dump(mode="json")
+    transport_name = (
+        "litellm_acompletion" if api_mode == "chat" else "litellm_aresponses"
+    )
+    success = (
+        create_mock_litellm_response("Improved draft.")
+        if api_mode == "chat"
+        else create_mock_responses_response("Improved draft.")
+    )
+    transport = AsyncMock(return_value=success)
+    monkeypatch.setattr(f"openhands.sdk.llm.llm.{transport_name}", transport)
+
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Draft."},
+    )
+
+    assert response.status_code == 200
+    assert transport.await_count == 1
+    payload = transport.call_args.kwargs
+    expected = min(profile_budget or 8192, 8192)
+    assert payload[budget_key] == expected
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        if key in payload:
+            assert payload[key] == expected
+    assert store.load("draft-profile").model_dump(mode="json") == profile_before
+
+
+@pytest.mark.parametrize("api_mode", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "extra_body",
+    [
+        {"store": True, "tools": [{"type": "web_search_preview"}]},
+        {"max_output_tokens": 32768},
+        {"custom_option": "private-profile-option-984a"},
+    ],
+)
+def test_enhance_rejects_provider_body_overrides(
+    client_and_store, monkeypatch, caplog, api_mode, extra_body
+):
+    client, store = client_and_store
+    store.save(
+        "draft-profile",
+        LLM(
+            model="openai/gpt-4.1-mini",
+            api_mode=api_mode,
+            api_key=SecretStr("sk-profile-secret"),
+            litellm_extra_body=extra_body,
+        ),
+        include_secrets=True,
+    )
+    profile_before = store.load("draft-profile").model_dump(mode="json")
+    chat_transport = AsyncMock(return_value=create_mock_litellm_response("Draft."))
+    responses_transport = AsyncMock(
+        return_value=create_mock_responses_response("Draft.")
+    )
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_acompletion", chat_transport)
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_aresponses", responses_transport)
+
+    availability = client.get("/api/prompt-enhancement/availability/draft-profile")
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "private-draft-782f"},
+    )
+
+    assert response.status_code == 422
+    assert error_code(response) == "unsupported_configuration"
+    assert availability.status_code == 422
+    assert error_code(availability) == "unsupported_configuration"
+    chat_transport.assert_not_awaited()
+    responses_transport.assert_not_awaited()
+    assert store.load("draft-profile").model_dump(mode="json") == profile_before
+    for sentinel in (
+        "private-draft-782f",
+        "private-profile-option-984a",
+        "sk-profile-secret",
+    ):
+        assert sentinel not in response.text + availability.text + caplog.text
+
+
+@pytest.mark.parametrize("subscription_flag", ["auth_type", "is_subscription"])
+def test_enhance_rejects_subscription_without_token_budget(
+    client_and_store, monkeypatch, subscription_flag
+):
+    client, store = client_and_store
+    llm = LLM(model="openai/gpt-4.1-mini", api_mode="responses")
+    if subscription_flag == "auth_type":
+        llm.auth_type = "subscription"
+    else:
+        llm.is_subscription = True
+    monkeypatch.setattr(store, "load", lambda *args, **kwargs: llm)
+    transport = AsyncMock()
+    monkeypatch.setattr("openhands.sdk.llm.llm.litellm_aresponses", transport)
+
+    availability = client.get("/api/prompt-enhancement/availability/draft-profile")
+    response = client.post(
+        "/api/prompt-enhancement/enhance",
+        json={"profile_name": "draft-profile", "text": "Draft."},
+    )
+
+    assert response.status_code == 422
+    assert error_code(response) == "unsupported_configuration"
+    assert availability.status_code == 422
+    assert error_code(availability) == "unsupported_configuration"
+    transport.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

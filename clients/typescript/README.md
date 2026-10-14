@@ -329,6 +329,10 @@ if (availability.available) {
 Aborting rejects the client request promptly. A disconnected client may not
 cancel the provider request; the Agent Server enforces its own timeout.
 Prompt enhancement is unavailable while LLM tracing or payload logging is enabled.
+Profiles with custom provider body options or subscription authentication are also
+unavailable: they cannot guarantee the no-tools, no-storage and output-token
+boundaries. Generation uses at most 8,192 output tokens, retaining a smaller
+profile limit when configured.
 Context-only OpenTelemetry instrumentation can still record private text in
 provider exceptions, so it is also rejected.
 

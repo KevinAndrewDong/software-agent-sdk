@@ -139,19 +139,20 @@ async def _load_profile(name: str, request: Request) -> LLM:
             "The selected profile or its credentials could not be resolved.",
         ) from None
 
-    if llm.auth_type == "subscription":
-        try:
-            from openhands.sdk.llm.auth.openai import (
-                create_subscription_llm_from_config,
-            )
-
-            llm = await asyncio.to_thread(create_subscription_llm_from_config, llm)
-        except Exception:
-            raise _EnhancementFailure(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,
-                "The selected profile's subscription credentials are unavailable.",
-            ) from None
+    if llm.auth_type == "subscription" or llm.is_subscription:
+        raise _EnhancementFailure(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,
+            "Subscription profiles do not support the enhancement output token limit.",
+        ) from None
+    if llm.litellm_extra_body:
+        # Providers merge these options after normal request parameters, so they
+        # can restore tools/storage or override the bounded generation budget.
+        raise _EnhancementFailure(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            PromptEnhancementErrorCode.UNSUPPORTED_CONFIGURATION,
+            "Prompt enhancement does not support custom provider body options.",
+        ) from None
 
     try:
         llm.uses_responses_api()
@@ -165,9 +166,17 @@ async def _load_profile(name: str, request: Request) -> LLM:
 
 
 def _quiet_llm(llm: LLM) -> LLM:
-    """Disable persisted completion logging and retries for this one-off call."""
+    """Bound generation and disable logging/retries for this one-off call."""
     quiet_llm = llm.model_copy(
-        update={"log_completions": False, "num_retries": 0, "caching_prompt": False}
+        update={
+            "log_completions": False,
+            "num_retries": 0,
+            "caching_prompt": False,
+            "max_output_tokens": min(
+                llm.effective_max_output_tokens or MAX_OUTPUT_TOKENS,
+                MAX_OUTPUT_TOKENS,
+            ),
+        }
     )
     quiet_llm.reset_metrics()
     return quiet_llm
@@ -256,13 +265,10 @@ async def enhance_prompt(
                 result = await llm.aresponses(
                     messages=messages,
                     tools=[],
-                    max_tokens=MAX_OUTPUT_TOKENS,
                     store=False,
                 )
             else:
-                result = await llm.acompletion(
-                    messages=messages, tools=[], max_tokens=MAX_OUTPUT_TOKENS
-                )
+                result = await llm.acompletion(messages=messages, tools=[])
     except _EnhancementFailure as failure:
         return _error_response(failure.status_code, failure.code, failure.message)
     except (TimeoutError, LLMTimeoutError):
