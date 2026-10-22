@@ -35,7 +35,7 @@ Routes: `GET /api/conversations/search`, `GET /api/conversations/count`,
 - `F04.create-observability-precedence`: body `observability_span_name`, `observability_tags` and `observability_parent_span_context` win over their headers, header metadata merges under the body's (body keys win), the parent-span header applies when the body has none, and an over-long or malformed span-name header, non-scalar header metadata and an empty body tag are 422.
 - `F04.create-secrets`: start-time `StaticSecret` values appear masked in the create response and are encrypted at rest.
 - `F04.create-secrets-get`: a start-time secret is listed by `GET /api/conversations/{id}` right after the create.
-- `F04.create-secrets-plain`: a plain-string secret value in the create body is accepted or rejected with 422, never a 500.
+- `F04.create-secrets-plain`: a plain-string secret value in the create body is rejected with 422, never a 500.
 - `F04.run-real`: an initial message runs on DeepSeek flash to `finished`; the events socket replays the run, the final response is non-empty and autotitle names the conversation.
 - `F04.final-response`: `agent_final_response` is empty before the agent answers, carries the exact `finish` message afterwards, and is 404 for an unknown id.
 - `F04.title-llm-profile`: with `title_llm_profile` naming a saved LLM profile, autotitle calls that profile and not the agent's LLM; an unknown profile name falls back to the agent's LLM and never fails the create.
@@ -404,17 +404,17 @@ EOF
   live state in place without an autosave, and GET reads the
   `base_state.json` snapshot. The secret appears after the next state save (a
   tags PATCH, a message), so the runtime itself still has it.
-- **Plain-string secret value (`F04.create-secrets-plain`), known bug.**
-  `POST .../secrets` accepts `{"NAME": "value"}`; the create body should either
-  accept it too or refuse it with 422.
+- **Plain-string secret value (`F04.create-secrets-plain`).**
+  `POST .../secrets` accepts `{"NAME": "value"}`, but the create body takes
+  only secret objects, so a plain string there is refused with 422.
   ```sh
   control-agent-server api POST /api/conversations \
     --json "{\"workspace\": {\"working_dir\": \"$W\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false, \"secrets\": {\"QA_F04_PLAIN\": \"qa-f04-plain-value\"}}" \
-    --expect 201,422 --save F04.create-secrets-plain/start  # bug: status eq 500 && response.body.exception contains "'str' object has no attribute 'pop'"
+    --expect 422 --check detail.0.type eq model_attributes_type --check detail.0.loc.2 eq QA_F04_PLAIN \
+    --save F04.create-secrets-plain/start
   ```
-  Today the server answers 500 `"exception": "'str' object has no attribute
-  'pop'"`: `DiscriminatedUnionMixin` calls `.pop("kind")` on the string, an
-  `AttributeError` that escapes request validation.
+  The answer is a standard 422 validation error on
+  `secrets.QA_F04_PLAIN` (`model_attributes_type`), never a 500.
 - **A real run (`F04.run-real`).** DeepSeek flash answers a one-line prompt;
   autotitle is on.
   ```sh
@@ -507,15 +507,14 @@ EOF
   ```
   Three ids return `[IID, null, FID]`; 99 unknown ids return 99 nulls; missing
   or malformed ids are 422.
-- **100 ids in one batch (`F04.batch-get-limit`), known bug.** The router
+- **100 ids in one batch (`F04.batch-get-limit`).** The router
   limits a batch to 99 ids.
   ```sh
   IDS100=$(python3 -c 'import uuid; print(",".join(str(uuid.uuid4()) for _ in range(100)))')
-  control-agent-server exec --expect-output QA_BATCH_OK --save F04.batch-get-limit/hundred -- python3 "$F/qa-f04-batch.py" "$IDS100" 400,422  # bug: exit_code eq 1 && stdout_tail contains '"status": 500'
+  control-agent-server exec --expect-output QA_BATCH_OK --expect-output 'at most 99 items' --save F04.batch-get-limit/hundred -- python3 "$F/qa-f04-batch.py" "$IDS100" 422
   ```
-  Expected: a 4xx that names the limit. Today it is 500 with an empty
-  `exception`: the limit is a bare `assert len(ids) < 100` in
-  `batch_get_conversations` (and disappears under `python -O`).
+  100 ids are a 422 whose detail names the limit ("List should have at most
+  99 items"); the OpenAPI schema declares `maxItems: 99` on `ids`.
 - **Search pages (`F04.search-page`).** Two new conversations make the newest
   two deterministic.
   ```sh
@@ -605,18 +604,18 @@ EOF
   ```
   Every refused update leaves the stored title and tags unchanged. The
   unknown-id case is `F04.patch-unknown-id`.
-- **Whitespace-only title (`F04.patch-whitespace-title`), known bug.** On the
-  child conversation, so the bug cannot leak into later bullets.
+- **Whitespace-only title (`F04.patch-whitespace-title`).** On the child
+  conversation, so a regression cannot leak into later bullets.
 
   Requires: `F04.create-parent`
   ```sh
   control-agent-server api PATCH "/api/conversations/$CHILD" --json '{"title": "QA F04 child"}' --check success eq true
-  control-agent-server api PATCH "/api/conversations/$CHILD" --json '{"title": "   "}' --expect 422 --save F04.patch-whitespace-title/patch  # bug: status eq 200 && response.body.success eq true
+  control-agent-server api PATCH "/api/conversations/$CHILD" --json '{"title": "   "}' --expect 422 --save F04.patch-whitespace-title/patch
   control-agent-server api GET "/api/conversations/$CHILD" --check title eq 'QA F04 child'
   ```
-  Expected: 422 (like an empty title) and the title kept. Today `min_length=1`
-  accepts `"   "`, the service stores `title.strip()`, and the title becomes
-  `""` (which also stops autotitle).
+  A whitespace-only title is rejected with 422 (like an empty title) and the
+  stored title is kept; without that, the service would store
+  `title.strip()`, `""`, which also stops autotitle.
 - **PATCH on an unknown id (`F04.patch-unknown-id`), known bug.** The OpenAPI
   document declares 404 for this route; the same id is 404 on GET.
   ```sh
@@ -746,7 +745,7 @@ EOF
   404 for PATCH and DELETE (the router tests lock the current codes; known
   bugs `F04.patch-unknown-id` and `F04.delete-unknown-id`). Check `success`
   on a PATCH, not only the status.
-- `GET /api/conversations` takes fewer than 100 ids (see
+- `GET /api/conversations` takes at most 99 ids; more are a 422 (see
   `F04.batch-get-limit`). Repeat `--query ids=...` once per id.
 - PATCH `tags` replaces the whole map; PATCH `title` alone leaves tags alone.
   A set title stops autotitle. PATCH, DELETE and `agent_final_response` load
