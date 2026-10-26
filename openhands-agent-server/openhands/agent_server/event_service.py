@@ -104,6 +104,10 @@ class ConversationRunLimitExceeded(RuntimeError):
     """The server has no capacity to start another conversation run."""
 
 
+class CondensationUnavailable(ValueError):
+    """The conversation's agent has no condenser that handles requests."""
+
+
 class _RunPermit:
     """Ref-counted permit shared by the chained runs of one admission session."""
 
@@ -553,10 +557,13 @@ class EventService:
 
         Reads directly from the EventLog without acquiring the state lock.
         EventLog reads are safe without the FIFOLock because events are
-        append-only and immutable once written.
+        append-only and immutable once written. Returns None for an unknown id.
         """
         events = self._events_for_read()
-        index = events.get_index(event_id)
+        try:
+            index = events.get_index(event_id)
+        except KeyError:
+            return None
         return events[index]
 
     async def get_event(self, event_id: str) -> Event | None:
@@ -2048,7 +2055,13 @@ class EventService:
             judge_llm,
             max_iterations=max_iterations or int(last["max_iterations"]),
         )
-        controller.iteration = int(last["iteration"])
+        # Every resume runs at least one more audit round, so keep one round
+        # in hand: a status persisted with the count already at the cap (by
+        # an older server, or a lower max_iterations override) must not let
+        # the resumed loop report more rounds than max_iterations.
+        controller.iteration = min(
+            int(last["iteration"]), controller.max_iterations - 1
+        )
         # Same busy guard as start_goal_loop: refuse a goal loop or active run.
         async with self._run_lock:
             if self._closing:
@@ -2306,6 +2319,20 @@ class EventService:
         """
         if not self._conversation:
             raise ValueError("inactive_service")
+
+        # A missing or request-ignoring condenser is the caller's agent
+        # configuration, not a server fault: report it as such instead of
+        # letting LocalConversation's ValueError surface as a 500.
+        condenser = self._conversation.agent.condenser
+        if condenser is None:
+            raise CondensationUnavailable(
+                "Cannot condense conversation: No condenser configured"
+            )
+        if not condenser.handles_condensation_requests():
+            raise CondensationUnavailable(
+                f"Cannot condense conversation: Condenser "
+                f"{type(condenser).__name__} does not handle condensation requests"
+            )
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._conversation.condense)
